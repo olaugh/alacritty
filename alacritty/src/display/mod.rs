@@ -605,6 +605,10 @@ impl Display {
     }
 
     fn swap_buffers(&self) {
+        magpie_capture::capture(
+            self.size_info.width() as usize,
+            self.size_info.height() as usize,
+        );
         #[allow(clippy::single_match)]
         let res = match (self.surface.deref(), &self.context.deref()) {
             #[cfg(not(any(target_os = "macos", windows)))]
@@ -1628,4 +1632,78 @@ fn window_size(
     let height = (padding.1).mul_add(2., grid_height).floor();
 
     PhysicalSize::new(width as u32, height as u32)
+}
+
+/// MAGPIE frame capture (for recording PR videos): when
+/// ALACRITTY_MAGPIE_FRAME_DIR names a directory, every frame is read back
+/// before the swap while <dir>/recording exists and written to
+/// <dir>/clip_NN/f_NNNNNN.rgba (RGBA, bottom-up rows as GL returns them),
+/// with "NNNNNN <CLOCK_MONOTONIC seconds> width height" lines in times.txt
+/// and "width height rgba flip" in size.txt. Not meant for upstream.
+mod magpie_capture {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    use crate::gl;
+
+    struct State {
+        dir: Option<String>,
+        recording: bool,
+        clip: u32,
+        frame: u32,
+    }
+
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    fn monotonic() -> f64 {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+        ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9
+    }
+
+    pub fn capture(width: usize, height: usize) {
+        let mut guard = STATE.lock().unwrap();
+        let state = guard.get_or_insert_with(|| State {
+            dir: std::env::var("ALACRITTY_MAGPIE_FRAME_DIR").ok().filter(|d| !d.is_empty()),
+            recording: false,
+            clip: 0,
+            frame: 0,
+        });
+        let Some(dir) = state.dir.clone() else { return };
+        if fs::metadata(format!("{dir}/recording")).is_err() {
+            state.recording = false;
+            return;
+        }
+        if !state.recording {
+            state.recording = true;
+            state.clip += 1;
+            state.frame = 0;
+            let _ = fs::create_dir_all(format!("{dir}/clip_{:02}", state.clip));
+        }
+        let n = state.frame;
+        state.frame += 1;
+        let when = monotonic();
+        let mut pixels = vec![0u8; width * height * 4];
+        unsafe {
+            gl::PixelStorei(gl::PACK_ALIGNMENT, 1);
+            gl::ReadPixels(
+                0,
+                0,
+                width as i32,
+                height as i32,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                pixels.as_mut_ptr() as *mut _,
+            );
+        }
+        let clip_dir = format!("{dir}/clip_{:02}", state.clip);
+        let _ = fs::write(format!("{clip_dir}/f_{n:06}.rgba"), &pixels);
+        let _ = fs::write(format!("{clip_dir}/size.txt"), format!("{width} {height} rgba flip\n"));
+        if let Ok(mut times) =
+            OpenOptions::new().create(true).append(true).open(format!("{clip_dir}/times.txt"))
+        {
+            let _ = writeln!(times, "{n:06} {when:.6} {width} {height}");
+        }
+    }
 }
